@@ -26,6 +26,7 @@ latent:
 # model: {}  # optional override of defaults
 
 rbpf:
+  enabled: true
   nparticles: 1500
   sigma_y: 0.15
   q_states: [0.01, 0.01, 0.01, 0.01, 0.01]
@@ -37,6 +38,27 @@ rbpf:
   resample_frac: 0.5
   horizon: 1
   random_seed: 123
+
+ekf:
+  enabled: true
+  sigma_y: 0.15
+  q_states: [0.03, 0.03, 0.03, 0.03, 0.03]
+  sigma_log_theta: 0.002
+  init_state_std: 0.2
+  init_param_log_std: 0.3
+  jacobian_eps: 1.0e-5
+
+ukf:
+  enabled: true
+  sigma_y: 0.15
+  q_states: [0.03, 0.03, 0.03, 0.03, 0.03]
+  sigma_log_theta: 0.002
+  init_state_std: 0.2
+  init_param_log_std: 0.3
+  points_alpha: 0.1
+  points_beta: 2.0
+  points_kappa: 0.0
+  random_seed: 456
 
 output_dir: runs
 save_npz: true

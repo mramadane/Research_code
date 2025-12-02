@@ -7,6 +7,7 @@ import numpy as np
 
 from .config import RBPFConfig
 from .model import ThermalParams, default_param_ranges, discrete_from_theta
+from .parameters import build_parameter_bounds
 
 
 @dataclass
@@ -67,27 +68,6 @@ def _sample_gaussian_mixture(means: np.ndarray, variances: np.ndarray, weights: 
     return means[idx] + stds * rng.standard_normal(nsamp)
 
 
-def _build_bounds(param_ranges: Dict[str, float | Tuple[float, float]]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    theta_names = ["Ci", "Cm", "Ce", "Ch", "Cs", "g_im", "g_ie", "g_ih", "g_is", "g_ea"]
-    theta_lo = np.empty(len(theta_names), float)
-    theta_hi = np.empty(len(theta_names), float)
-    is_fixed = np.zeros(len(theta_names), dtype=bool)
-    for j, nm in enumerate(theta_names):
-        spec = param_ranges[nm]
-        if isinstance(spec, (tuple, list)) and len(spec) == 2:
-            lo, hi = float(spec[0]), float(spec[1])
-        else:
-            lo = hi = float(spec)
-        lo = max(lo, 1e-20)
-        hi = max(hi, 1e-20)
-        theta_lo[j] = lo
-        theta_hi[j] = hi
-        is_fixed[j] = (hi == lo)
-    free_idx = np.nonzero(~is_fixed)[0]
-    fixed_idx = np.nonzero(is_fixed)[0]
-    return theta_lo, theta_hi, free_idx, fixed_idx
-
-
 def run_rbpf(
     y_meas: np.ndarray,
     u: np.ndarray,
@@ -106,7 +86,11 @@ def run_rbpf(
     N = int(len(y_meas))
     param_ranges = param_ranges or default_param_ranges(params)
 
-    theta_lo, theta_hi, free_idx, fixed_idx = _build_bounds(param_ranges)
+    bounds = build_parameter_bounds(param_ranges)
+    theta_lo = bounds.theta_lo
+    theta_hi = bounds.theta_hi
+    free_idx = bounds.free_idx
+    fixed_idx = bounds.fixed_idx
     theta_eps = 1e-20
 
     rng = np.random.default_rng(cfg.random_seed)

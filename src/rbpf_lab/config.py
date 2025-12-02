@@ -76,6 +76,7 @@ class ModelConfig:
 class RBPFConfig:
     """RBPF hyper-parameters."""
 
+    enabled: bool = True
     nparticles: int = 4000
     sigma_y: float = 0.15
     q_states: tuple[float, float, float, float, float] = (0.01, 0.01, 0.01, 0.01, 0.01)
@@ -90,6 +91,35 @@ class RBPFConfig:
 
 
 @dataclass
+class EKFConfig:
+    """Extended Kalman filter hyper-parameters."""
+
+    enabled: bool = True
+    sigma_y: float = 0.15
+    q_states: tuple[float, float, float, float, float] = (0.03, 0.03, 0.03, 0.03, 0.03)
+    sigma_log_theta: float = 0.002
+    init_state_std: float = 0.2
+    init_param_log_std: float = 0.3
+    jacobian_eps: float = 1e-5
+
+
+@dataclass
+class UKFConfig:
+    """Unscented Kalman filter hyper-parameters."""
+
+    enabled: bool = True
+    sigma_y: float = 0.15
+    q_states: tuple[float, float, float, float, float] = (0.03, 0.03, 0.03, 0.03, 0.03)
+    sigma_log_theta: float = 0.002
+    init_state_std: float = 0.2
+    init_param_log_std: float = 0.3
+    points_alpha: float = 0.1
+    points_beta: float = 2.0
+    points_kappa: float = 0.0
+    random_seed: int = 456
+
+
+@dataclass
 class RunConfig:
     """Top-level configuration for a single run."""
 
@@ -99,6 +129,8 @@ class RunConfig:
     latent: SignalConfig
     model: ModelConfig = field(default_factory=ModelConfig)
     rbpf: RBPFConfig = field(default_factory=RBPFConfig)
+    ekf: EKFConfig = field(default_factory=EKFConfig)
+    ukf: UKFConfig = field(default_factory=UKFConfig)
     output_dir: Path = Path("runs")
     save_npz: bool = True
 
@@ -133,6 +165,8 @@ def load_config(path: Path) -> RunConfig:
 
     model = ModelConfig(**raw.get("model", {}))
     rbpf_cfg = RBPFConfig(**raw.get("rbpf", {}))
+    ekf_cfg = EKFConfig(**raw.get("ekf", {}))
+    ukf_cfg = UKFConfig(**raw.get("ukf", {}))
     output_dir = Path(raw.get("output_dir", "runs"))
     save_npz = bool(raw.get("save_npz", True))
 
@@ -143,6 +177,8 @@ def load_config(path: Path) -> RunConfig:
         latent=latent,
         model=model,
         rbpf=rbpf_cfg,
+        ekf=ekf_cfg,
+        ukf=ukf_cfg,
         output_dir=output_dir,
         save_npz=save_npz,
     )

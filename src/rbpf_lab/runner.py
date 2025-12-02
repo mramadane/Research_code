@@ -11,16 +11,18 @@ import yaml
 
 from .config import RunConfig, SignalConfig, load_config
 from .data_loading import WeatherSeries, align_weather, load_radiation, load_temperature
+from .ekf import EKFResult, run_ekf
 from .model import ThermalParams, simulate_states
 from .rbpf import RBPFResult, run_rbpf
 from .signals import Event, generate_pulse_heating, generate_square_heating
+from .ukf import UKFResult, run_ukf
 
 
 def _to_jsonable(obj):
     if isinstance(obj, Path):
         return str(obj)
     if isinstance(obj, (list, tuple)):
-        return [ _to_jsonable(o) for o in obj ]
+        return [_to_jsonable(o) for o in obj]
     if isinstance(obj, dict):
         return {k: _to_jsonable(v) for k, v in obj.items()}
     if hasattr(obj, "__dict__"):
@@ -49,7 +51,9 @@ class RunOutputs:
     signals: Signals
     truth: GroundTruth
     y_meas: np.ndarray
-    rbpf: RBPFResult
+    rbpf: RBPFResult | None = None
+    ekf: EKFResult | None = None
+    ukf: UKFResult | None = None
     out_dir: Path
 
 
@@ -83,7 +87,7 @@ def _build_signal(cfg: SignalConfig, N: int, dt_seconds: int) -> Tuple[np.ndarra
     return sig, tuple(events)
 
 
-def run_experiment(cfg: RunConfig, *, output_dir_override: Path | None = None) -> RunOutputs:
+def run_experiment(cfg: RunConfig, *, output_dir_override: Path | None = None, filters: Tuple[str, ...] | None = None) -> RunOutputs:
     temp_df = load_temperature(cfg.files.temperature_file)
     rad_df = load_radiation(cfg.files.solar_file)
     weather = align_weather(temp_df, rad_df, cfg.window.start, cfg.window.end, cfg.window.dt_seconds)
@@ -106,15 +110,43 @@ def run_experiment(cfg: RunConfig, *, output_dir_override: Path | None = None) -
     rng = np.random.default_rng(cfg.rbpf.random_seed + 7)
     y_meas = y_true + rng.normal(0.0, cfg.rbpf.sigma_y, size=y_true.shape)
 
-    rbpf_result = run_rbpf(
-        y_meas=y_meas,
-        u=heater,
-        t_out_k=weather.t_out_k,
-        u_s=weather.u_s,
-        params=params,
-        dt_seconds=cfg.window.dt_seconds,
-        cfg=cfg.rbpf,
-    )
+    filter_set = {f.lower() for f in filters} if filters else {"rbpf", "ekf", "ukf"}
+
+    rbpf_result = None
+    if cfg.rbpf.enabled and "rbpf" in filter_set:
+        rbpf_result = run_rbpf(
+            y_meas=y_meas,
+            u=heater,
+            t_out_k=weather.t_out_k,
+            u_s=weather.u_s,
+            params=params,
+            dt_seconds=cfg.window.dt_seconds,
+            cfg=cfg.rbpf,
+        )
+
+    ekf_result = None
+    if cfg.ekf.enabled and "ekf" in filter_set:
+        ekf_result = run_ekf(
+            y_meas=y_meas,
+            u=heater,
+            t_out_k=weather.t_out_k,
+            u_s=weather.u_s,
+            params=params,
+            dt_seconds=cfg.window.dt_seconds,
+            cfg=cfg.ekf,
+        )
+
+    ukf_result = None
+    if cfg.ukf.enabled and "ukf" in filter_set:
+        ukf_result = run_ukf(
+            y_meas=y_meas,
+            u=heater,
+            t_out_k=weather.t_out_k,
+            u_s=weather.u_s,
+            params=params,
+            dt_seconds=cfg.window.dt_seconds,
+            cfg=cfg.ukf,
+        )
 
     out_dir = output_dir_override or cfg.output_dir
     if out_dir:
@@ -132,6 +164,8 @@ def run_experiment(cfg: RunConfig, *, output_dir_override: Path | None = None) -
         truth=GroundTruth(states=X_true, measurements=y_true),
         y_meas=y_meas,
         rbpf=rbpf_result,
+        ekf=ekf_result,
+        ukf=ukf_result,
         out_dir=out_dir,
     )
 
@@ -151,27 +185,56 @@ def save_outputs(outputs: RunOutputs) -> Path:
         )
 
     if outputs.config.save_npz:
-        np.savez_compressed(
-            run_dir / "rbpf_outputs.npz",
-            timestamps=outputs.weather.timestamps,
-            t_out_c=outputs.weather.t_out_c,
-            t_out_k=outputs.weather.t_out_k,
-            u_s=outputs.weather.u_s,
-            heater=outputs.signals.heater_w,
-            latent=outputs.signals.latent_w,
-            y_true=outputs.truth.measurements,
-            y_meas=outputs.y_meas,
-            ti_lo=outputs.rbpf.ti_lo,
-            ti_md=outputs.rbpf.ti_md,
-            ti_hi=outputs.rbpf.ti_hi,
-            theta_lo=outputs.rbpf.theta_lo,
-            theta_md=outputs.rbpf.theta_md,
-            theta_hi=outputs.rbpf.theta_hi,
-            alpha_lo=outputs.rbpf.alpha_lo,
-            alpha_md=outputs.rbpf.alpha_md,
-            alpha_hi=outputs.rbpf.alpha_hi,
-            regime_flag=outputs.rbpf.regime_flag,
-        )
+        payload = {
+            "timestamps": outputs.weather.timestamps,
+            "t_out_c": outputs.weather.t_out_c,
+            "t_out_k": outputs.weather.t_out_k,
+            "u_s": outputs.weather.u_s,
+            "heater": outputs.signals.heater_w,
+            "latent": outputs.signals.latent_w,
+            "y_true": outputs.truth.measurements,
+            "y_meas": outputs.y_meas,
+        }
+
+        if outputs.rbpf is not None:
+            payload.update(
+                dict(
+                    rbpf_ti_lo=outputs.rbpf.ti_lo,
+                    rbpf_ti_md=outputs.rbpf.ti_md,
+                    rbpf_ti_hi=outputs.rbpf.ti_hi,
+                    rbpf_theta_lo=outputs.rbpf.theta_lo,
+                    rbpf_theta_md=outputs.rbpf.theta_md,
+                    rbpf_theta_hi=outputs.rbpf.theta_hi,
+                    rbpf_alpha_lo=outputs.rbpf.alpha_lo,
+                    rbpf_alpha_md=outputs.rbpf.alpha_md,
+                    rbpf_alpha_hi=outputs.rbpf.alpha_hi,
+                    rbpf_regime_flag=outputs.rbpf.regime_flag,
+                )
+            )
+
+        if outputs.ekf is not None:
+            payload.update(
+                dict(
+                    ekf_ti_mean=outputs.ekf.ti_mean,
+                    ekf_ti_var=outputs.ekf.ti_var,
+                    ekf_theta_traj=outputs.ekf.theta_traj,
+                    ekf_y_pred=outputs.ekf.y_pred,
+                    ekf_innov_var=outputs.ekf.innov_var,
+                )
+            )
+
+        if outputs.ukf is not None:
+            payload.update(
+                dict(
+                    ukf_ti_mean=outputs.ukf.ti_mean,
+                    ukf_ti_var=outputs.ukf.ti_var,
+                    ukf_theta_traj=outputs.ukf.theta_traj,
+                    ukf_y_pred=outputs.ukf.y_pred,
+                    ukf_innov_var=outputs.ukf.innov_var,
+                )
+            )
+
+        np.savez_compressed(run_dir / "filters_outputs.npz", **payload)
 
     events_path = run_dir / "events.json"
     with open(events_path, "w", encoding="utf-8") as f:
@@ -187,9 +250,9 @@ def save_outputs(outputs: RunOutputs) -> Path:
     return run_dir
 
 
-def load_and_run(config_path: Path, *, output_dir: Path | None = None, persist: bool = True) -> RunOutputs:
+def load_and_run(config_path: Path, *, output_dir: Path | None = None, filters: Tuple[str, ...] | None = None, persist: bool = True) -> RunOutputs:
     cfg = load_config(config_path)
-    outputs = run_experiment(cfg, output_dir_override=output_dir)
+    outputs = run_experiment(cfg, output_dir_override=output_dir, filters=filters)
     if persist:
         run_dir = save_outputs(outputs)
         outputs.out_dir = run_dir

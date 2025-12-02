@@ -25,17 +25,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip writing artifacts to disk (still runs the filter).",
     )
+    parser.add_argument(
+        "--filters",
+        type=str,
+        default=None,
+        help="Comma-separated list of filters to run (rbpf,ekf,ukf). Default: all enabled.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    outputs = load_and_run(args.config, output_dir=args.output_dir, persist=not args.no_save)
+    filters = None
+    if args.filters:
+        filters = tuple(f.strip().lower() for f in args.filters.split(",") if f.strip())
 
-    ti_final = outputs.rbpf.ti_md[-1]
+    outputs = load_and_run(args.config, output_dir=args.output_dir, filters=filters, persist=not args.no_save)
+
     print(f"Completed run with config: {args.config}")
     print(f"Time steps: {outputs.weather.timestamps.size}, dt={outputs.config.window.dt_seconds}s")
-    print(f"Final indoor temperature median estimate: {ti_final - 273.15:.3f} C")
+    if outputs.rbpf is not None:
+        print(f"RBPF final Ti median: {outputs.rbpf.ti_md[-1]:.3f} C")
+    if outputs.ekf is not None:
+        print(f"EKF final Ti mean: {outputs.ekf.ti_mean[-1] - 273.15:.3f} C")
+    if outputs.ukf is not None:
+        print(f"UKF final Ti mean: {outputs.ukf.ti_mean[-1] - 273.15:.3f} C")
     if not args.no_save:
         print(f"Artifacts saved under: {outputs.out_dir}")
 
