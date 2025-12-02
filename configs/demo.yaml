@@ -1,0 +1,42 @@
+files:
+  temperature_file: Data/dwd_20242025.txt
+  solar_file: Data/radiation_20242025.txt
+
+window:
+  start: "2024-03-17 00:00"
+  end: "2024-07-17 00:00"
+  dt_seconds: 120
+
+heater:
+  kind: square
+  power: 800.0
+  p_start: 0.0035
+  min_duration_s: 1200
+  max_duration_s: 3600
+  seed: 456
+
+latent:
+  kind: square
+  power: 7000.0
+  p_start: 0.0011
+  min_duration_s: 1200
+  max_duration_s: 28800
+  seed: 321
+
+# model: {}  # optional override of defaults
+
+rbpf:
+  nparticles: 1500
+  sigma_y: 0.15
+  q_states: [0.01, 0.01, 0.01, 0.01, 0.01]
+  alpha_min: 0.01
+  alpha_max: 12.0
+  sigma_eta: 0.06
+  a_lw: 0.99
+  g_min: 0.05
+  resample_frac: 0.5
+  horizon: 1
+  random_seed: 123
+
+output_dir: runs
+save_npz: true
