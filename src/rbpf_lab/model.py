@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import numpy as np
+from scipy.signal import cont2discrete
 
 from .config import ModelConfig
 from .data_loading import WeatherSeries
@@ -107,26 +108,29 @@ def _conductance_matrix(theta: np.ndarray) -> np.ndarray:
     return (A_c.T * invC).T
 
 
-def discrete_from_theta_single(theta: np.ndarray, dt_seconds: float, aw: float, ae: float, eta_h: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Euler discretization for a single parameter vector."""
-    A_c = _conductance_matrix(theta)
+def _continuous_inputs(theta: np.ndarray, aw: float, ae: float, eta_h: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     Ci, Cm, Ce, Ch, Cs, gim, gie, gih, gis, gea = theta
-
     B_u = np.zeros((5,), float)
     B_u[3] = eta_h / Ch
     B_To = np.zeros((5,), float)
     B_To[0] = 0.0
     B_To[2] = gea / Ce
-
     B_Us = np.zeros((5,), float)
     B_Us[0] = aw / Ci
     B_Us[2] = ae / Ce
+    B_F = np.zeros((5,), float)
+    B_F[0] = 1.0 / Ci
+    return _conductance_matrix(theta), B_u, B_To, B_Us, B_F
 
-    Phi = np.eye(5) + A_c * dt_seconds
-    Gam_u = B_u * dt_seconds
-    Gam_To = B_To * dt_seconds
-    Gam_Us = B_Us * dt_seconds
-    return Phi, Gam_u, Gam_To, Gam_Us
+
+def discrete_from_theta_single(theta: np.ndarray, dt_seconds: float, aw: float, ae: float, eta_h: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Exact ZOH discretization for a single parameter vector."""
+    A_c, B_u, B_To, B_Us, _ = _continuous_inputs(theta, aw, ae, eta_h)
+    B_c = np.column_stack((B_u, B_To, B_Us))
+    C_dummy = np.zeros((1, 5))
+    D_dummy = np.zeros((1, 3))
+    Phi, B_d, _, _, _ = cont2discrete((A_c, B_c, C_dummy, D_dummy), dt_seconds, method="zoh")
+    return Phi, B_d[:, 0], B_d[:, 1], B_d[:, 2]
 
 
 def discrete_from_theta(theta_arr: np.ndarray, dt_seconds: float, aw: float, ae: float, eta_h: float):
@@ -182,6 +186,54 @@ def discrete_from_theta(theta_arr: np.ndarray, dt_seconds: float, aw: float, ae:
     return Phi, Gam_u, Gam_To, Gam_Us
 
 
+def continuous_from_theta(theta_arr: np.ndarray, aw: float, ae: float, eta_h: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized continuous-time matrices used inside the RBPF."""
+    Ci = theta_arr[:, 0]
+    Cm = theta_arr[:, 1]
+    Ce = theta_arr[:, 2]
+    Ch = theta_arr[:, 3]
+    Cs = theta_arr[:, 4]
+    gim = theta_arr[:, 5]
+    gie = theta_arr[:, 6]
+    gih = theta_arr[:, 7]
+    gis = theta_arr[:, 8]
+    gea = theta_arr[:, 9]
+    gia = np.zeros_like(gea)
+
+    invC = np.stack([1.0 / Ci, 1.0 / Cm, 1.0 / Ce, 1.0 / Ch, 1.0 / Cs], axis=1)
+    G00 = -(gim + gie + gih + gis + gia)
+    G01 = gim
+    G02 = gie
+    G03 = gih
+    G04 = gis
+    G10 = gim
+    G11 = -gim
+    G20 = gie
+    G22 = -(gie + gea)
+    G30 = gih
+    G33 = -gih
+    G40 = gis
+    G44 = -gis
+    Z0 = np.zeros_like(G00)
+
+    A0 = np.stack([G00, G01, G02, G03, G04], axis=1) * invC[:, [0]]
+    A1 = np.stack([G10, G11, Z0, Z0, Z0], axis=1) * invC[:, [1]]
+    A2 = np.stack([G20, Z0, G22, Z0, Z0], axis=1) * invC[:, [2]]
+    A3 = np.stack([G30, Z0, Z0, G33, Z0], axis=1) * invC[:, [3]]
+    A4 = np.stack([G40, Z0, Z0, Z0, G44], axis=1) * invC[:, [4]]
+    A_c = np.stack([A0, A1, A2, A3, A4], axis=1)
+
+    B_u = np.zeros((theta_arr.shape[0], 5), float)
+    B_u[:, 3] = eta_h / Ch
+    B_To = np.zeros((theta_arr.shape[0], 5), float)
+    B_To[:, 0] = 0.0
+    B_To[:, 2] = gea * (1.0 / Ce)
+    B_Us = np.zeros((theta_arr.shape[0], 5), float)
+    B_Us[:, 0] = aw * (1.0 / Ci)
+    B_Us[:, 2] = ae * (1.0 / Ce)
+    return A_c, B_u, B_To, B_Us
+
+
 def simulate_states(
     params: ThermalParams,
     weather: WeatherSeries,
@@ -197,13 +249,13 @@ def simulate_states(
     else:
         q_std_arr = np.asarray(q_std, float)
 
-    Phi_c = _conductance_matrix(params.theta_vector)
-    B_u = np.zeros((5,), float)
-    B_u[3] = params.eta_h / params.Ch
-    F_out = np.array([params.g_ia / params.Ci, 0.0, params.g_ea / params.Ce, 0.0, 0.0])
-    B_sol = np.array([params.aw / params.Ci, 0.0, params.ae / params.Ce, 0.0, 0.0])
-    B_F = np.zeros((5,), float)
-    B_F[0] = 1.0 / params.Ci
+    theta = params.theta_vector
+    A_c, B_u, B_To, B_Us, B_F = _continuous_inputs(theta, params.aw, params.ae, params.eta_h)
+    B_total = np.column_stack((B_u, B_To, B_Us, B_F))
+    C_dummy = np.zeros((1, 5))
+    D_dummy = np.zeros((1, 4))
+    Phi, B_d, _, _, _ = cont2discrete((A_c, B_total, C_dummy, D_dummy), dt_seconds, method="zoh")
+    Gu, GTo, GUs, GF = B_d[:, 0], B_d[:, 1], B_d[:, 2], B_d[:, 3]
 
     x = np.array([weather.t_out_k[0]] * 5, float)
     X = np.zeros((weather.timestamps.size, 5), float)
@@ -211,14 +263,13 @@ def simulate_states(
     rng = np.random.default_rng(seed)
 
     for k in range(weather.timestamps.size - 1):
-        dx = (
-            Phi_c @ x
-            + B_u * heater_w[k]
-            + F_out * weather.t_out_k[k]
-            + B_sol * weather.u_s[k]
-            + B_F * latent_w[k]
+        x = (
+            Phi @ x
+            + heater_w[k] * Gu
+            + weather.t_out_k[k] * GTo
+            + weather.u_s[k] * GUs
+            + latent_w[k] * GF
         )
-        x = x + dt_seconds * dx
         x = x + rng.normal(0.0, q_std_arr)
         X[k + 1] = x
 

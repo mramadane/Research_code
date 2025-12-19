@@ -37,7 +37,7 @@ Edit or copy `configs/demo.yaml`. Key fields:
 - `files.temperature_file` / `files.solar_file`: paths to DWD-like CSVs.
 - `window.start`, `window.end`, `window.dt_seconds`: time range and grid spacing.
 - `heater` and `latent`: choose `kind: square` or `kind: pulse` plus power / probability / duration options.
-- `rbpf`, `ekf`, `ukf`: enable / disable each filter and tune their noise settings.
+- `rbpf`, `ekf`, `ukf`: enable / disable each filter and tune their noise settings (RBPF also exposes `substep_seconds`, `gate_quiet`, and `gate_burst`).
 - `model` (optional): override default capacities / resistances / areas if testing a different building.
 
 All parameters are resolved into strongly typed dataclasses (`rbpf_lab.config`) before running.
@@ -51,5 +51,5 @@ All parameters are resolved into strongly typed dataclasses (`rbpf_lab.config`) 
 
 ## Notes
 - The raw Colab export (`Raw_files/rbpf_hist_q_v2.py`) is preserved intact; new code lives under `src/`.
-- Dependencies stay light (NumPy, pandas, FilterPy, PyYAML). Add plotting or control-toolbox packages as needed for your analysis scripts.
+- Dependencies stay light (NumPy, pandas, SciPy, FilterPy, PyYAML). Add plotting or control-toolbox packages as needed for your analysis scripts.
 - If you point the config at your own data, ensure timestamps follow the DWD format or adapt the loaders in `rbpf_lab.data_loading`.

@@ -81,12 +81,15 @@ class RBPFConfig:
     sigma_y: float = 0.15
     q_states: tuple[float, float, float, float, float] = (0.01, 0.01, 0.01, 0.01, 0.01)
     alpha_min: float = 0.01
-    alpha_max: float = 12.0
-    sigma_eta: float = 0.06
+    alpha_max: float = 25.0
+    sigma_eta: float = 0.1
     a_lw: float = 0.99
     g_min: float = 0.05
+    gate_quiet: float = 0.40
+    gate_burst: float = 0.95
     resample_frac: float = 0.5
     horizon: int = 1
+    substep_seconds: float = 60.0
     random_seed: int = 123
 
 

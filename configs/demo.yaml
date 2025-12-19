@@ -31,12 +31,15 @@ rbpf:
   sigma_y: 0.15
   q_states: [0.01, 0.01, 0.01, 0.01, 0.01]
   alpha_min: 0.01
-  alpha_max: 12.0
-  sigma_eta: 0.06
+  alpha_max: 25.0
+  sigma_eta: 0.1
   a_lw: 0.99
   g_min: 0.05
+  gate_quiet: 0.4
+  gate_burst: 0.95
   resample_frac: 0.5
   horizon: 1
+  substep_seconds: 60.0
   random_seed: 123
 
 ekf:

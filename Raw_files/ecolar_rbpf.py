@@ -47,12 +47,6 @@ from numpy.random import default_rng
 import control
 from scipy.linalg import expm
 
-def filter_multi_column_changes(df, cols, time_col="Timestamp"): #We only keep rows where a changes in columns in col occurs
-    df = df.sort_values(time_col).reset_index(drop=True)
-    shifted = df[cols].shift(1)
-    changed = (df[cols] != shifted).any(axis=1)
-    return df[changed].reset_index(drop=True)
-
 def find_and_split_gaps(
     df: pd.DataFrame,
     min_lag_seconds: int,
@@ -144,13 +138,15 @@ def interpolate_to_grid(df, dt_seconds=60, time_col="Timestamp", interpolate_col
 # ────────────────────────────────────────────────────────────────────────────
 # 1) LOAD  +  PRE‑PROCESS (Robust 15-Min Aggregation)
 # ────────────────────────────────────────────────────────────────────────────
-dt_seconds = 1800  # 30 minutes
+dt_seconds = 300  # 5 minutes 300s
 csv_path   = "final_merged_dataframe_full_DWD4.csv"
 
 # 1. Load, Parse, Sort, and Filter Dates
 df = pd.read_csv(csv_path, parse_dates=["Timestamp"]).sort_values("Timestamp", ignore_index=True)
-df = df.loc[(df["Timestamp"] >= "2025-05-04 03:30") & (df["Timestamp"] <= "2025-06-14 23:00")].reset_index(drop=True)
+#df = df.loc[(df["Timestamp"] >= "2025-05-01 03:30") & (df["Timestamp"] <= "2025-05-29 23:00")].reset_index(drop=True) for paper
+display(df)
 
+df = df.loc[(df["Timestamp"] >= "2025-05-05 15:30") & (df["Timestamp"] <= "2025-05-30 23:00")].reset_index(drop=True)
 # 2. Ensure Numeric Columns (Relays + PV)
 relay_cols = ["Relay 4", "Relay 5"]
 pv_cols    = ["my-pv1", "my-pv2", "my-pv3"]
@@ -161,20 +157,15 @@ for c in relay_cols + pv_cols:
 #    We do this before resampling so we capture the true ON/OFF cycles.
 df["heat_input"] = (df[pv_cols].sum(axis=1) + df[relay_cols].sum(axis=1)) * 1000.0
 
-# 4. CRITICAL: Resample to 15-Minute Grid
-#    - heat_input -> mean (Preserves Energy: Watts * Time)
-#    - Temp2 -> first (The state at the beginning of the step)
-#    - Outside/Other -> mean (Smooths boundary conditions)
+# 4.: Resample
 df_15 = df.set_index("Timestamp").resample(f"{dt_seconds}s").agg({
-    "Temp2": "first",
+    "Temp2": "mean",
     "Sensor_outside": "mean",
     "Other_room_temp": "mean",
-    "heat_input": "mean"
+    "heat_input": "first"
 }).dropna().reset_index()
 
-# 5. Gap Detection on the NEW 15-min grid
-#    We check if we have any missing 15-min blocks.
-#    (min_lag_seconds set to slightly larger than dt_seconds to catch gaps)
+# 5. Gap Detection
 list_of_dfs = find_and_split_gaps(df=df_15, min_lag_seconds=dt_seconds + 60)
 base_df = max(list_of_dfs, key=len)
 
@@ -290,11 +281,8 @@ from scipy.optimize import minimize
 from scipy.signal import cont2discrete
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4-state CT model: Air + Two Walls + Heater Node
+# 4-state CT model: Air + Two Walls + Heater Node (10 Parameters)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Geometry / Constants
-N_X0 = 3  # Number of hidden states (Wall_Out, Wall_In, Heater)
 
 # Keys (10 parameters now)
 POS_KEYS_4C = [
@@ -383,25 +371,31 @@ def build_system_d_4nodes(pos, dt):
 # Simulation / Loss / Bounds
 # ─────────────────────────────────────────────────────────────────────────────
 def z_to_params_4c(z):
+    """Converts the 10-element parameter vector z into the parameter dictionary."""
     z = np.asarray(z, float)
-    # First 10 are physical params
+    # z now contains only the 10 physical parameters
     pos_vals = z[:10]
-    # Next 3 are hidden states [T_wo, T_wi, T_h]
-    x0_h     = z[10:13]
     pos = {k: float(v) for k, v in zip(POS_KEYS_4C, pos_vals)}
-    return pos, x0_h
+    return pos
 
 def simulate_open_loop_4c(z, u, T_out, T_or, y, dt, return_states=False):
-    pos, x0_h = z_to_params_4c(z)
+    """
+    Open-loop simulation using ZOH.
+    Initial state is fixed by a physical heuristic.
+    """
+    # z contains only 10 physical parameters now
+    pos = z_to_params_4c(z)
     Phi, Gamma, R = build_system_d_4nodes(pos, dt)
 
     N = len(u)
     X = np.zeros((N, 4), float) # 4 States
-    x = np.zeros(4, float)
 
-    # Initial conditions
-    x[0] = float(y[0])        # State 0: Air (measured)
-    x[1:] = np.asarray(x0_h)  # States 1,2,3: Wall_O, Wall_I, Heater
+    # --- FIXED INITIAL CONDITIONS (Heuristic) ---
+    # T_air[0] = y[0] (Measured)
+    # T_wall_out[0] = T_out[0] (Outside temp)
+    # T_wall_in[0] = y[0] (Room temp)
+    # T_heater[0] = y[0] (Room temp)
+    x = np.array([y[0], T_out[0], y[0], y[0]], float)
     X[0] = x
 
     for k in range(N - 1):
@@ -419,35 +413,35 @@ def simulate_open_loop_4c(z, u, T_out, T_or, y, dt, return_states=False):
     return (y_hat, X, Phi, Gamma, R) if return_states else (y_hat, Phi, Gamma, R)
 
 def loss_open_loop_z_4c(z, u, T_out, T_or, y, dt, warmup_seconds=0.0):
+    """
+    Loss function for optimization. Note: z is only the 10 physical parameters.
+    The initial state is determined inside simulate_open_loop_4c.
+    """
     y_hat, Phi, Gamma, R = simulate_open_loop_4c(z, u, T_out, T_or, y, dt)
     if y_hat is None:
         return 1e12
 
     W = int(round(max(0.0, warmup_seconds) / dt))
+    # We always skip the first point y[0] because it's used for initialization
     err = y_hat[1 + W:] - y[1 + W:]
     return float(np.mean(err * err))
 
 def _set_bounds_4c():
+    """Returns bounds for the 10 physical parameters only."""
     b = []
     # --- Capacities (J/K) ---
     b += [(1.8e4, 3.0e7)]   # C_air
     b += [(1.0e5, 2.0e7)]   # C_wall_out
     b += [(1.0e5, 2.0e7)]   # C_wall_in
-    b += [(1.0e2, 5.0e5)]   # C_heater (New: Metal mass, smaller than air/walls)
+    b += [(1.0e2, 5.0e5)]   # C_heater
 
     # --- Conductances (W/K) ---
     b += [(1.0, 9000.0)]    # g_air_ow
     b += [(1.0, 9000.0)]    # g_air_iw
-    b += [(0.0, 20.0)]      # g_air_outside (Infiltration)
-    b += [(10.0, 500.0)]    # g_wo_outside
-    b += [(10.0, 500.0)]    # g_wi_other
-    b += [(5.0, 5000.0)]    # g_air_heater (New: Radiator/Fan transfer rate)
-
-    # --- Hidden Initial States ---
-    # We now have 3 hidden states: [T_wo, T_wi, T_heater]
-    # Heater usually starts somewhere between room temp and max temp
-    b += [(-10.0, 40.0)] * 2 # Walls
-    b += [(10.0, 80.0)]      # Heater core might start hotter or same as room
+    b += [(0.0, 20.0)]      # g_air_outside
+    b += [(10.0, 9000.0)]   # g_wo_outside
+    b += [(10.0, 9000.0)]   # g_wi_other
+    b += [(5.0, 5000.0)]    # g_air_heater
 
     return b
 
@@ -455,8 +449,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 
+# Assuming the modified helper functions (z_to_params_4c, simulate_open_loop_4c, _set_bounds_4c, loss_open_loop_z_4c)
+# from the previous step are accessible.
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) SETUP INITIAL GUESSES (4-NODE PHYSICS)
+# 1) SETUP INITIAL GUESSES (4-NODE PHYSICS - 10 Parameters)
 # ─────────────────────────────────────────────────────────────────────────────
 # Updated Units list for 10 parameters
 POS_UNITS_4C = [
@@ -466,36 +463,36 @@ POS_UNITS_4C = [
     "W/K"                        # g_air_heater
 ]
 
-area_ow   = 200.0   # m² (Outer Wall Area)
-area_iw   = 30.36   # m² (Inner Wall Area)
-alpha_in  = 8.0     # W/m²K (Indoor convection coefficient)
+# --- Geometry / Constants (Ensure these variables are defined in the environment) ---
+# dt = dt_seconds
+# rho_air, cp_air = 1.225, 1007.0
+# V_room = 182.52
+# area_ow = 200.0, area_iw = 30.36, alpha_in = 8.0, UA_out_target = 60.0, UA_or_target = 45.0
+# T_out_train, y_train are available NumPy arrays.
 
-# Ensure dt is defined (mapped to your 15-min setting)
-dt = dt_seconds     # 900.0
-rho_air, cp_air = 1.225, 1007.0  # kg/m3, J/kgK
-V_room  = 182.52                 # m3 (Volume)
+dt = dt_seconds  # Example: 900.0 (Assuming dt_seconds is defined)
+rho_air, cp_air = 1.225, 1007.0
+V_room  = 182.52
+area_ow   = 200.0
+area_iw   = 30.36
+alpha_in  = 8.0
+UA_out_target = 60.0
+UA_or_target  = 45.0
+
 
 # --- 1. Capacities [J/K] ---
-C_air0    = rho_air * cp_air * V_room  # ~2.25e5
-C_wo0     = 4.0e6                      # Heavy outer wall
-C_wi0     = 3.0e6                      # Inner wall
-C_heater0 = 5.0e4                      # NEW: Heater Mass (e.g., ~100kg iron/oil radiator)
+C_air0    = rho_air * cp_air * V_room
+C_wo0     = 4.0e6
+C_wi0     = 3.0e6
+C_heater0 = 5.0e4
 
 # --- 2. Conductances [W/K] ---
-# Geometry derived
 g_air_ow0 = alpha_in * area_ow
 g_air_iw0 = alpha_in * area_iw
-
-# Wall -> Boundary (Derived from target U-values)
-UA_out_target = 60.0
 g_wo_outside0 = 1.0 / max(1.0/UA_out_target - 1.0/g_air_ow0, 1e-12)
-
-UA_or_target  = 45.0
 g_wi_other0   = 1.0 / max(1.0/UA_or_target - 1.0/g_air_iw0, 1e-12)
-
-# New & Misc
-g_air_outside0 = 2.0    # Infiltration
-g_air_heater0  = 300.0  # NEW: Heater->Air coupling (High for fan/radiator)
+g_air_outside0 = 2.0
+g_air_heater0  = 300.0
 
 # Pack Physical Parameters (10 values)
 pos0_vals = np.array([
@@ -505,29 +502,23 @@ pos0_vals = np.array([
     g_air_heater0
 ], float)
 
-# --- 3. Hidden Initial States [T_wo, T_wi, T_h] ---
-# We have 3 hidden states now.
-# Heuristic:
-# 1. Wall Out starts at Outside Temp
-# 2. Wall In starts at Indoor Temp
-# 3. Heater starts at Indoor Temp (assuming it was off)
-x0_hidden0 = np.array([T_out_train[0], y_train[0], y_train[0]], float)
+# --- 3. Initial State is NO LONGER OPTIMIZED. ---
+# The optimization vector z_start now ONLY contains the 10 physical parameters.
+z_start = pos0_vals.copy()
 
-# Combine into one vector z
-z_start = np.concatenate([pos0_vals, x0_hidden0])
-
-# Get Bounds (Using the 4c bounds function from previous block)
+# Get Bounds (Uses the updated _set_bounds_4c with only 10 items)
 bounds = _set_bounds_4c()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2) RUN OPTIMIZATION (4-NODE)
 # ─────────────────────────────────────────────────────────────────────────────
-print(f"Starting Optimization with {len(z_start)} parameters...")
+# T_out_train, T_or_train, y_train are available from prior steps.
+print(f"Starting Optimization with {len(z_start)} physical parameters...")
 
 res = minimize(
     fun=loss_open_loop_z_4c,
     x0=z_start,
-    # Note: args must match the signature of loss_open_loop_z_4c
+    # Note: Initial state is handled inside simulate_open_loop_4c using the heuristic.
     args=(u_train, T_out_train, T_or_train, y_train, dt, 0.0),
     method="L-BFGS-B",
     bounds=bounds,
@@ -542,12 +533,13 @@ print(f"Final MSE Loss: {res.fun:.6f}")
 # ─────────────────────────────────────────────────────────────────────────────
 # Run one final simulation with the best parameters
 best_z = res.x
+# The simulation function now internally uses the heuristic for the initial state.
 y_hat, X_states, Phi, Gamma, R = simulate_open_loop_4c(
     best_z, u_train, T_out_train, T_or_train, y_train, dt, return_states=True
 )
 
-# Extract physical names
-best_pos, _ = z_to_params_4c(best_z)
+# Extract physical names (z_to_params_4c now only returns the dict)
+best_pos = z_to_params_4c(best_z)
 
 # --- PLOTTING ---
 plt.figure(figsize=(12, 10))
@@ -593,42 +585,44 @@ for (k, v), u in zip(best_pos.items(), units):
     print(f"{k:<15} : {v:<12.4f}   {u}")
 
 import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
 from scipy.signal import cont2discrete
 
-# ─────────────────────────────────────────────────────────────────────────────
+# │───────────────────────────────────────────────────────────────
 # 1) SETTINGS & HYPERPARAMETERS
-# ─────────────────────────────────────────────────────────────────────────────
-Np = 30000                 # Number of Particles
+# │────────────────────────────────────────────────────────────────
+Np = 20000          # Number of Particles
 dt_seconds = dt_seconds        # Time step (should be 900s / 15 mins)
-sigma_y_pf = 0.1          # Measurement noise (Temp2)
+sigma_y_pf = 0.1          # Measurement noise (Temp2) 0.1 for opti
 print(f"RBPF running with dt: {dt_seconds}s")
 
 # Baseline process noise (per-state) [Air, Wall_Out, Wall_In, Heater]
 # Added 4th value for Heater noise
-q_states = np.array([0.05, 0.05, 0.05, 0.05], float)
+q_states = np.array([0.03, 0.03, 0.03, 0.03], float)
 
 # Global SV (Random Walk on log alpha)
-alpha_min, alpha_max = 0.01, 30.0
-sigma_eta_post = 0.06
+alpha_min, alpha_max = 0.01, 15.0 #0.01, 15.0
+sigma_eta_post = 0.05
 
 # Liu–West (log-space)
-a_lw  = 0.99
+a_lw   = 0.99
 h2_lw = 1.0 - a_lw**2
 
 # Gating (Alpha-based)
-g_min = 0.05      # Minimum learning rate
-F_quiet = 0.30    # Bottom 30% = Quiet
-F_burst = 0.80    # Top 20% = Burst
+g_min = 0.05       # Minimum learning rate
+F_quiet = 0.4     # Bottom 40% = Quiet
+F_burst = 0.95     # Top 5% = Burst
 
 # Resampling
 resample_frac = 0.5
 
 # Mixture sampling counts
-Nsamp_mixture_state = 1000
+Nsamp_mixture_state = 2000
 
-# ─────────────────────────────────────────────────────────────────────────────
+# │────────────────────────────────────────────────────────────────
 # 2) HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# │────────────────────────────────────────────────────────────────
 def systematic_resample(w, rng):
     N = w.size
     u0 = (rng.random() + np.arange(N)) / N
@@ -697,7 +691,7 @@ def get_continuous_matrices_4state(theta_arr):
     A[:,0,0] = -(gao + gai + gah + gao_ext) / Ca
     A[:,0,1] = gao / Ca
     A[:,0,2] = gai / Ca
-    A[:,0,3] = gah / Ca  # From Heater
+    A[:,0,3] = gah / Ca   # From Heater
 
     # Row 1: Wall Out (Connects to Air, Outside)
     A[:,1,0] = gao / Cwo
@@ -725,30 +719,26 @@ def get_continuous_matrices_4state(theta_arr):
     B[:,2,2] = gwi_oth / Cwi     # T_or -> Wall In
 
     # Row 3: Heater Node (Gets the Power Input)
-    # Note: If 'eta' (efficiency) was removed, this is just 1.0/Ch.
-    # If parameters included efficiency, it would be eta/Ch.
-    # Assuming direct heating:
     B[:,3,0] = 1.0 / Ch          # u -> Heater Node
 
     return A, B
 
-# ─────────────────────────────────────────────────────────────────────────────
+# │────────────────────────────────────────────────────────────────
 # 3) DATA PREPARATION & INITIALIZATION
-# ─────────────────────────────────────────────────────────────────────────────
+# │────────────────────────────────────────────────────────────────
 # Extract arrays from base_df
-Y_meas    = base_df["Temp2"].to_numpy(dtype=float)
-u_arr     = base_df["heat_input"].to_numpy(dtype=float)
+Y_meas     = base_df["Temp2"].to_numpy(dtype=float)
+u_arr      = base_df["heat_input"].to_numpy(dtype=float)
 T_out_arr = base_df["Sensor_outside"].to_numpy(dtype=float)
-T_or_arr  = base_df["Other_room_temp"].to_numpy(dtype=float)
+T_or_arr   = base_df["Other_room_temp"].to_numpy(dtype=float)
 
 N = len(Y_meas)
 rng = np.random.default_rng(42)
 
 # Measurement Matrix: We observe State 0 (Air)
-# Now 1x4 because state vector is 4x1
 C_y = np.array([[1, 0, 0, 0]], float)
 
-# Parameter Definitions (Updated for 4 Nodes)
+# Parameter Definitions (10)
 theta_names = [
     "C_air", "C_wo", "C_wi", "C_heater",
     "g_ao", "g_ai", "g_ao_ext", "g_wo_ext", "g_wi_other",
@@ -756,55 +746,60 @@ theta_names = [
 ]
 d_theta = len(theta_names)
 
-# Define Ranges
+# Define Ranges (omitted for brevity, assuming they are defined correctly)
 _param_defaults = {
-    "C_air":    (1.0e3, 8.0e6),
-    "C_wo":     (1.0e3, 8.0e6),
-    "C_wi":     (1.0e3, 8.0e6),
-    "C_heater": (1.0e3, 5.0e5),    # Heater thermal mass
-    "g_ao":     (0.1, 9000.0),
-    "g_ai":     (0.1, 9000.0),
-    "g_ao_ext": (0.1, 9000.0),
-    "g_wo_ext": (0.1, 9000.0),
-    "g_wi_other":(50, 900.0),
-    "g_ah":     (5.0, 9000.0)      # Heater-Air coupling
+    "C_air":      (1.8e4, 8.0e6),
+    "C_wo":      (1.0e5, 2.0e7),
+    "C_wi":      (1.0e5, 2.0e7),
+    "C_heater": (1e2, 5.0e5),
+    "g_ao":      (1, 9000.0),
+    "g_ai":      (1, 9000.0),
+    "g_ao_ext": (0, 9000.0),
+    "g_wo_ext": (10, 9000.0),
+    "g_wi_other":(10, 9000.0),
+    "g_ah":      (5.0, 5000.0)
 }
 
 theta_lo = np.empty(d_theta, float)
 theta_hi = np.empty(d_theta, float)
 theta_eps = 1e-20
-
 for j, nm in enumerate(theta_names):
     spec = _param_defaults[nm]
     theta_lo[j] = max(float(spec[0]), theta_eps)
     theta_hi[j] = max(float(spec[1]), theta_eps)
 
-# Initialize States [Air, Wall_Out, Wall_In, Heater]
-T_start = float(Y_meas[0])
-# Create (Np, 4) matrix
-m = np.tile(np.array([T_start]*4, float), (Np, 1))
-m += rng.normal(0, 0.5, size=m.shape)
+# --- UPDATED STATE INITIALIZATION LOGIC ---
+T_air_start = float(Y_meas[0])
+T_out_start = float(T_out_arr[0]) # Get initial outside temperature
+
+# Initialize the mean state vector for all particles using the heuristic:
+# [T_air_start, T_out_start, T_air_start, T_air_start]
+m_initial_mean = np.array([T_air_start, T_out_start, T_air_start, T_air_start], float)
+
+# Create (Np, 4) matrix m initialized around this mean
+m = np.tile(m_initial_mean, (Np, 1))
+m += rng.normal(0, 0.5, size=m.shape) # Add initial noise
 
 # Covariance 4x4
 P0 = np.diag([0.5**2, 2.0**2, 2.0**2, 5.0**2])
-P  = np.tile(P0, (Np, 1, 1))
+P   = np.tile(P0, (Np, 1, 1))
 
-# Initialize Alpha
+# Initialize Alpha (omitted for brevity, remains unchanged)
 log_alpha = rng.normal(0.0, 0.1, size=Np)
 log_alpha = np.clip(log_alpha, np.log(alpha_min), np.log(alpha_max))
-alpha     = np.exp(log_alpha)
+alpha      = np.exp(log_alpha)
 
-# Initialize Theta (Log-Uniform)
+# Initialize Theta (Log-Uniform - omitted for brevity, remains unchanged)
 phi_lo = np.log(theta_lo)
 phi_hi = np.log(theta_hi)
-phi    = rng.uniform(low=phi_lo[None, :], high=phi_hi[None, :], size=(Np, d_theta))
-theta  = np.exp(phi)
+phi      = rng.uniform(low=phi_lo[None, :], high=phi_hi[None, :], size=(Np, d_theta))
+theta    = np.exp(phi)
 
 logw = np.full(Np, -np.log(Np), float)
 Q0_diag = q_states**2
 R = np.array([[sigma_y_pf**2]], float)
 
-# Storage & Diagnostics
+# Storage & Diagnostics (omitted for brevity, remains unchanged)
 regime_flag = np.zeros(N, dtype=int)
 z_std_innov = np.zeros(N)
 
@@ -817,7 +812,7 @@ alpha_hist_counts = np.full(n_bins_alpha, 1.0, dtype=float)
 q_lo, q_md, q_hi = 0.025, 0.50, 0.975
 Ti_lo = np.zeros(N); Ti_md = np.zeros(N); Ti_hi = np.zeros(N)
 Y_pred_mean = np.full(N, np.nan)
-Y_pred_std  = np.full(N, np.nan)
+Y_pred_std   = np.full(N, np.nan)
 
 Th_lo = np.zeros((N, d_theta))
 Th_md = np.zeros((N, d_theta))
@@ -827,18 +822,18 @@ Alpha_lo = np.zeros(N)
 Alpha_md = np.zeros(N)
 Alpha_hi = np.zeros(N)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# │────────────────────────────────────────────────────────────────
 # 4) MAIN RBPF LOOP (EULER SUB-STEPPING - 4 STATE)
-# ─────────────────────────────────────────────────────────────────────────────
+# │────────────────────────────────────────────────────────────────
 const_ll = -0.5 * np.log(2*np.pi)
-I4_batch = np.eye(4)[None, :, :]  # Identity matrix 4x4
+I4_batch = np.eye(4)[None, :, :]    # Identity matrix 4x4
 
 print(f"Starting RBPF on {N} samples with {Np} particles (4-State Sub-Stepping)...")
 
 for k in range(1, N):
     # Inputs at k-1
     uk   = u_arr[k-1]
-    Tok  = T_out_arr[k-1]
+    Tok   = T_out_arr[k-1]
     Tork = T_or_arr[k-1]
 
     # Measurement at k
@@ -846,12 +841,12 @@ for k in range(1, N):
 
     w_lin_prior = np.exp(logw - logsumexp(logw))
 
-    # --- (A) Global SV Step ---
+    # --- (A) Global SV Step --- (Unchanged)
     log_alpha = log_alpha + rng.normal(0.0, sigma_eta_post, size=Np)
     log_alpha = np.clip(log_alpha, np.log(alpha_min), np.log(alpha_max))
     alpha     = np.exp(log_alpha)
 
-    # --- (B) Alpha Gating Logic ---
+    # --- (B) Alpha Gating Logic --- (Unchanged)
     alpha_med_k = wquantile(alpha, w_lin_prior, [0.5])[0]
     log_alpha_med_k = np.log(np.clip(alpha_med_k, alpha_min, alpha_max))
 
@@ -874,16 +869,16 @@ for k in range(1, N):
 
     g_k = max(g_alpha, g_min)
 
-    # --- (C) Liu-West Step (Parameter Update) ---
+    # --- (C) Liu-West Step (Parameter Update) --- (Unchanged)
     phi = np.log(np.clip(theta, theta_eps, None))
 
-    a_k  = 1.0 - g_k * (1.0 - a_lw)
+    a_k   = 1.0 - g_k * (1.0 - a_lw)
     h2_k = g_k * h2_lw
 
     phi_bar_free = np.sum(phi * w_lin_prior[:, None], axis=0)
-    diff_free    = phi - phi_bar_free[None, :]
-    V_free       = diff_free.T @ (diff_free * w_lin_prior[:, None])
-    V_free       = 0.5 * (V_free + V_free.T) + 1e-12 * np.eye(d_theta)
+    diff_free     = phi - phi_bar_free[None, :]
+    V_free      = diff_free.T @ (diff_free * w_lin_prior[:, None])
+    V_free      = 0.5 * (V_free + V_free.T) + 1e-12 * np.eye(d_theta)
 
     L_free   = np.linalg.cholesky(V_free)
     eps_free = rng.standard_normal((Np, d_theta)) @ (np.sqrt(h2_k) * L_free.T)
@@ -892,13 +887,13 @@ for k in range(1, N):
     phi   = np.clip(phi, phi_lo[None, :], phi_hi[None, :])
     theta = np.exp(phi)
 
-    # --- (D) Kalman Predict Step (Sub-Stepped Euler) ---
+    # --- (D) Kalman Predict Step (Sub-Stepped Euler) --- (Unchanged)
     # 1. Get continuous matrices (4x4)
     A_c, B_c = get_continuous_matrices_4state(theta)
 
-    # 2. Setup Sub-stepping (30 steps for stability with 15-min dt)
-    dt_total = dt_seconds  # e.g., 900.0
-    n_subs   = 30          # 30 * 30s = 900s (Very stable)
+    # 2. Setup Sub-stepping
+    dt_total = dt_seconds
+    n_subs   = 15
     dt_sub   = dt_total / n_subs
 
     # 3. Prepare Inputs (Np, 3)
@@ -929,7 +924,7 @@ for k in range(1, N):
     for s in range(4): # Loop over 4 states
         P_pred[:, s, s] += qdiag[:, s]
 
-    # --- (E) Likelihood & Weight Update ---
+    # --- (E) Likelihood & Weight Update --- (Unchanged)
     # y_hat = C * m_pred
     y_pred = (m_pred @ C_y.T).ravel()
 
@@ -944,26 +939,26 @@ for k in range(1, N):
     w_lin_post = np.exp(logw)
 
     # Save Stats
-    mu_k  = np.sum(w_lin_prior * y_pred)
+    mu_k   = np.sum(w_lin_prior * y_pred)
     var_k = np.sum(w_lin_prior * (y_pred**2 + S)) - mu_k**2
     Y_pred_mean[k] = mu_k
-    Y_pred_std[k]  = np.sqrt(max(var_k, 1e-12))
+    Y_pred_std[k]   = np.sqrt(max(var_k, 1e-12))
     z_std_innov[k] = (yk - mu_k) / np.sqrt(max(var_k, 1e-12))
 
-    # --- (F) Kalman Update Step ---
-    K = (P_pred @ C_y.T) / S[:, None, None]  # (Np, 4, 1)
+    # --- (F) Kalman Update Step --- (Unchanged)
+    K = (P_pred @ C_y.T) / S[:, None, None]    # (Np, 4, 1)
     m = m_pred + (K.reshape(Np, 4) * innov[:, None])
 
     KC = np.matmul(K, C_y)
-    P  = np.matmul(I4_batch - KC, P_pred)
+    P   = np.matmul(I4_batch - KC, P_pred)
 
-    # Store Air Temp Quantiles
+    # Store Air Temp Quantiles (Unchanged)
     Ti_draws = sample_from_weighted_gaussian_mixture(
         m[:, 0], P[:, 0, 0], w_lin_post, Nsamp_mixture_state, rng
     )
     Ti_lo[k], Ti_md[k], Ti_hi[k] = np.quantile(Ti_draws, [q_lo, q_md, q_hi])
 
-    # Parameter and Alpha quantiles
+    # Parameter and Alpha quantiles (Unchanged)
     for j in range(d_theta):
         Th_lo[k, j], Th_md[k, j], Th_hi[k, j] = wquantile(
             theta[:, j], w_lin_post, [q_lo, q_md, q_hi]
@@ -973,7 +968,7 @@ for k in range(1, N):
         alpha, w_lin_post, [q_lo, q_md, q_hi]
     )
 
-    # --- (G) Resampling ---
+    # --- (G) Resampling --- (Unchanged)
     Neff = 1.0 / np.sum(w_lin_post**2)
     if Neff < resample_frac * Np:
         idx = systematic_resample(w_lin_post, rng)
@@ -1031,25 +1026,6 @@ plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.show()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2) PLOT STOCHASTIC VOLATILITY (Alpha)
-# ─────────────────────────────────────────────────────────────────────────────
-plt.figure(figsize=(12, 4))
-plt.plot(timestamps, Alpha_md, color='purple', linewidth=1.5)
-plt.fill_between(timestamps, Alpha_lo, Alpha_hi, color='purple', alpha=0.2)
-plt.ylabel("Alpha (Scale Factor)")
-plt.title("Median Stochastic Volatility (Model Uncertainty Scaling)")
-plt.grid(True, alpha=0.3)
-
-# Highlight "Burst" regimes if you tracked them
-burst_indices = np.where(regime_flag == 1)[0]
-if len(burst_indices) > 0:
-    plt.scatter(timestamps.iloc[burst_indices], Alpha_md[burst_indices],
-                color='red', s=10, label="Burst Regime (High Learning)")
-    plt.legend()
-
-plt.show()
-
-# ─────────────────────────────────────────────────────────────────────────────
 # 3) PRINT FINAL PARAMETER ESTIMATES
 # ─────────────────────────────────────────────────────────────────────────────
 print("\n=== Final Parameter Estimates (Median at t=N) ===")
@@ -1061,6 +1037,120 @@ for j, name in enumerate(theta_names):
     lo  = Th_lo[-1, j]
     hi  = Th_hi[-1, j]
     print(f"{name:<15} : {med:<12.4f} | ({lo:.4f} - {hi:.4f})")
+
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) CALCULATE COVERAGE METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+# Align arrays (Skip k=0 as usual)
+y_true = Y_meas[1:]
+y_est  = Ti_md[1:]   # Median estimate
+y_lb   = Ti_lo[1:]   # 2.5% Quantile
+y_ub   = Ti_hi[1:]   # 97.5% Quantile
+time_v = base_df["Timestamp"].iloc[1:]
+
+# Boolean mask: Is observation inside the 95% CI?
+is_covered = (y_true >= y_lb) & (y_true <= y_ub)
+
+# Metrics
+coverage_pct = np.mean(is_covered) * 100.0
+avg_width    = np.mean(y_ub - y_lb)
+rmse_closed  = np.sqrt(np.mean((y_true - y_est)**2))
+num_violations = np.sum(~is_covered)
+
+print(f"=== Closed-Loop RBPF Coverage Analysis ===")
+print(f"Target Confidence Level: 95.0%")
+print(f"Actual Coverage:         {coverage_pct:.2f}%")
+print(f"Average CI Width:        {avg_width:.3f} °C")
+print(f"Closed-Loop RMSE:        {rmse_closed:.3f} °C")
+print(f"Violations:              {num_violations} out of {len(y_true)} steps")
+
+# Check Calibration Status
+if coverage_pct < 90.0:
+    print(">> STATUS: OVER-CONFIDENT. (Filter bounds are too tight. Process noise might be too low).")
+elif coverage_pct > 98.0:
+    print(">> STATUS: UNDER-CONFIDENT. (Filter bounds are too wide. Process noise might be too high).")
+else:
+    print(">> STATUS: WELL CALIBRATED. (Coverage is close to 95%).")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) VISUALIZATION
+# ─────────────────────────────────────────────────────────────────────────────
+fig = make_subplots(
+    rows=2, cols=1,
+    row_heights=[0.7, 0.3],
+    vertical_spacing=0.1,
+    subplot_titles=("RBPF Confidence Intervals vs Measurement", "Residual Histogram")
+)
+
+# --- Top Plot: Bands and Violations ---
+
+# 1. Confidence Band (Grey Area)
+fig.add_trace(go.Scatter(
+    x=time_v, y=y_ub,
+    mode='lines', line=dict(width=0),
+    showlegend=False, hoverinfo='skip'
+), row=1, col=1)
+
+fig.add_trace(go.Scatter(
+    x=time_v, y=y_lb,
+    mode='lines', line=dict(width=0),
+    fill='tonexty', fillcolor='rgba(100, 100, 100, 0.2)',
+    name='95% CI Band'
+), row=1, col=1)
+
+# 2. Median Estimate
+fig.add_trace(go.Scatter(
+    x=time_v, y=y_est,
+    mode='lines', name='RBPF Median',
+    line=dict(color='blue', width=1.5)
+), row=1, col=1)
+
+# 3. Measurements (Dots)
+fig.add_trace(go.Scatter(
+    x=time_v, y=y_true,
+    mode='markers', name='Measurement',
+    marker=dict(color='black', size=3, opacity=0.5)
+), row=1, col=1)
+
+# 4. Highlight Violations (Red X)
+# Get indices where coverage failed
+violation_idx = np.where(~is_covered)[0]
+if len(violation_idx) > 0:
+    fig.add_trace(go.Scatter(
+        x=time_v.iloc[violation_idx],
+        y=y_true[violation_idx],
+        mode='markers', name='Outside Bounds',
+        marker=dict(color='red', symbol='x', size=6, line=dict(width=1, color='red'))
+    ), row=1, col=1)
+
+# --- Bottom Plot: Residual Histogram ---
+residuals = y_true - y_est
+fig.add_trace(go.Histogram(
+    x=residuals,
+    nbinsx=50,
+    name='Residuals',
+    marker_color='blue',
+    opacity=0.7
+), row=2, col=1)
+
+# Update Layout
+fig.update_layout(
+    title_text=f"RBPF Calibration Check (Coverage: {coverage_pct:.1f}%)",
+    height=800,
+    hovermode="x unified",
+    showlegend=True
+)
+
+fig.update_xaxes(title_text="Time", row=1, col=1)
+fig.update_yaxes(title_text="Temperature (°C)", row=1, col=1)
+fig.update_xaxes(title_text="Residual Error (°C)", row=2, col=1)
+fig.update_yaxes(title_text="Count", row=2, col=1)
+
+fig.show()
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -1121,8 +1211,13 @@ def simulate_open_loop_final_4state(theta_vec, u, T_out, T_or, y_start, dt_total
     N_sim = len(u)
     X_sim = np.zeros((N_sim, 4))
 
-    # Initial State: Assume everything starts at measured air temp
-    x = np.array([y_start, y_start, y_start, y_start])
+    # --- CORRECTED INITIALIZATION ---
+    # We use the first value of the PASSED T_out array
+    T_out_start = T_out[0]
+
+    # [T_air, T_wo, T_wi, T_h]
+    # T_wo initialized to T_out_start, others to y_start
+    x = np.array([y_start, T_out_start, y_start, y_start], dtype=float)
 
     # Sub-step settings (match RBPF)
     n_subs = 30
@@ -1339,194 +1434,621 @@ fig.update_xaxes(matches='x', row=2, col=1)
 
 fig.show()
 
-# Cell 2: Build ARX design matrix (lags of y and exogenous inputs)
-# Make plots a bit nicer
-plt.rcParams["figure.figsize"] = (12, 4)
-plt.rcParams["axes.grid"] = True
-
-# Target and exogenous variables for ARX
-y_col = "Temp2"
-exog_cols = ["heat_input", "Sensor_outside", "Other_room_temp"]
-
-# ARX lag order (m)
-lag_order = 3  # for example
-df = base_df.copy()
-
-y = df[y_col].values.astype(float)
-exogs = [df[c].values.astype(float) for c in exog_cols]
-
-N = len(df)
-m = lag_order
-if N <= m:
-    raise ValueError("Time series too short for given lag_order.")
-
-# Collect lagged features in a list, then stack
-X_list = []
-
-# 1) Lags of y: y(t-1)...y(t-m)
-for lag in range(1, m + 1):
-    # from index (m-lag) up to (N-lag-1) inclusive -> length N-m
-    X_list.append(y[m - lag : N - lag])
-
-# 2) Lags of each exogenous input: u_j(t-1)...u_j(t-m)
-for ex in exogs:
-    for lag in range(1, m + 1):
-        X_list.append(ex[m - lag : N - lag])
-
-# Design matrix X (N_eff x n_features)
-X = np.column_stack(X_list)
-
-# Target y(t)
-y_target = y[m:]
-
-# Aligned dataframe (index from m onward)
-df_eff = df.iloc[m:].copy()
-
-print(f"Design matrix shape X: {X.shape}, target length: {len(y_target)}")
-# Add intercept explicitly: [1, X]
-X_with_intercept = np.column_stack([np.ones(len(X)), X])
-
-# Solve y = X_with_intercept @ beta in least squares sense
-beta_hat, residuals, rank, svals = np.linalg.lstsq(X_with_intercept, y_target, rcond=None)
-
-intercept = beta_hat[0]
-coef = beta_hat[1:]
-
-print(f"Intercept: {intercept:.4f}")
-print(f"Number of coefficients: {len(coef)}")
-
-# Cell 4: Closed-loop (1-step-ahead) prediction
-
-# Closed-loop predictions are just X_with_intercept @ beta_hat
-y_hat_closed = X_with_intercept @ beta_hat
-
-# True values aligned with y_hat_closed
-y_true_closed = y_target.copy()
-time_closed = df_eff.index
-
-# Residuals (true - predicted)
-residuals_closed = y_true_closed - y_hat_closed
-
-print("Closed-loop prediction done.")
-print(f"RMSE (closed-loop): {np.sqrt(np.mean((y_true_closed - y_hat_closed)**2)):.4f}")
-
-# Cell 5: Open-loop (free-run) prediction
-
-# We need to split coef into:
-#   first m: lags of y
-#   then for each exog, m coefficients
-n_exog = len(exog_cols)
-idx = 0
-
-# Coefficients for y lags
-a_y = coef[idx : idx + m]
-idx += m
-
-# Coefficients for exog lags: shape (n_exog, m)
-b_ex = []
-for _ in range(n_exog):
-    b_ex.append(coef[idx : idx + m])
-    idx += m
-b_ex = np.array(b_ex)  # (n_exog, m)
-
-# Prepare recursive simulation on full series
-N = len(df)
-y_full = df[y_col].values.astype(float)
-exogs_full = [df[c].values.astype(float) for c in exog_cols]
-
-# Allocate array for predictions
-y_hat_full = np.zeros(N, dtype=float)
-
-# Warm start: use true values for first m samples
-y_hat_full[:m] = y_full[:m]
-
-# Now simulate forward
-for t in range(m, N):
-    # y lags from predicted series
-    y_lags = np.array([y_hat_full[t - lag] for lag in range(1, m + 1)])
-
-    # exog lags from true series
-    exog_lags_all = []
-    for ex in exogs_full:
-        exog_lags_all.append([ex[t - lag] for lag in range(1, m + 1)])
-    exog_lags_all = np.array(exog_lags_all)  # (n_exog, m)
-
-    # Linear prediction
-    y_t_hat = intercept + a_y @ y_lags + np.sum(b_ex * exog_lags_all)
-    y_hat_full[t] = y_t_hat
-
-# Align open-loop outputs with y (starting at m)
-y_hat_open = y_hat_full[m:]
-y_true_open = y_full[m:]
-time_open = df.index[m:]
-
-print("Open-loop prediction done.")
-print(f"RMSE (open-loop): {np.sqrt(np.mean((y_true_open - y_hat_open)**2)):.4f}")
-
+import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-# Create a figure with a secondary y-axis for the Heater
-fig = make_subplots(specs=[[{"secondary_y": True}]])
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+min_len_hours = 3.0   # minimum length in hours for a "no-freeze" interval
 
-# 1. Measured Temperature (Ground Truth)
-fig.add_trace(
-    go.Scatter(
-        x=time_open,
-        y=y_true_open,
-        name="Measured Temp (True)",
-        line=dict(color='black', width=1, dash='dot')
-    ),
-    secondary_y=False
-)
+# regime_flag[1:] is aligned with ts_plot, alpha_plot
+no_freeze = (regime_flag[1:] != 1)   # True where there is NO freeze
+no_freeze_int = no_freeze.astype(int)
 
-# 2. Open-Loop Model Prediction
-fig.add_trace(
-    go.Scatter(
-        x=time_open,
-        y=y_hat_open,
-        name="Open-Loop Prediction (Simulated)",
-        line=dict(color='blue', width=2)
-    ),
-    secondary_y=False
-)
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) FIND CONTIGUOUS RUNS OF NO-FREEZE
+# ─────────────────────────────────────────────────────────────────────────────
+diff = np.diff(no_freeze_int)
 
-# 3. Heater Power (Context)
-# We access the heater column from the original dataframe using the same time index
-# Checks if 'heat_input' exists in your dataframe (based on previous context)
-if "heat_input" in df.columns:
-    fig.add_trace(
-        go.Scatter(
-            x=time_open,
-            y=df.loc[time_open, "heat_input"],
-            name="Heater Power (W)",
-            line=dict(color='red', width=1.5),
-            opacity=0.3,
-            fill='tozeroy' # Fills area to see ON/OFF clearly
-        ),
-        secondary_y=True
+# +1: start of a True-run (False→True)
+# -1: end of a True-run (True→False)
+run_starts = np.where(diff == 1)[0] + 1
+run_ends   = np.where(diff == -1)[0]
+
+# Handle edge cases where run starts at 0 or ends at last index
+if no_freeze[0]:
+    run_starts = np.r_[0, run_starts]
+if no_freeze[-1]:
+    run_ends = np.r_[run_ends, len(no_freeze) - 1]
+
+assert len(run_starts) == len(run_ends)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) FILTER BY MINIMUM DURATION AND STORE (start_index, end_index)
+# ─────────────────────────────────────────────────────────────────────────────
+dt_hours = dt_seconds / 3600.0
+
+non_freeze_intervals_idx = []   # (start_index, end_index) in ts_plot / alpha_plot space
+non_freeze_intervals_ts  = []   # (start_timestamp, end_timestamp)
+
+for s, e in zip(run_starts, run_ends):
+    num_steps = (e - s + 1)
+    run_hours = num_steps * dt_hours
+
+    if run_hours >= min_len_hours:
+        non_freeze_intervals_idx.append((int(s), int(e)))
+        non_freeze_intervals_ts.append((ts_plot.iloc[s], ts_plot.iloc[e]))
+
+print("Non-freeze intervals (indices):", non_freeze_intervals_idx)
+print("Non-freeze intervals (timestamps):", non_freeze_intervals_ts)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) PLOT: ALPHA WITH SHADED NO-FREEZE INTERVALS
+# ─────────────────────────────────────────────────────────────────────────────
+fig_intervals = go.Figure()
+
+# Alpha trajectory
+fig_intervals.add_trace(go.Scatter(
+    x=ts_plot,
+    y=alpha_plot,
+    mode='lines',
+    name='Median Alpha'
+))
+
+# Shade each no-freeze interval
+for (s, e) in non_freeze_intervals_idx:
+    fig_intervals.add_vrect(
+        x0=ts_plot.iloc[s],
+        x1=ts_plot.iloc[e],
+        fillcolor="rgba(0, 200, 0, 0.2)",
+        line_width=0,
+        layer="below",
+        annotation_text="no-freeze",
+        annotation_position="top left"
     )
 
-# Formatting
-fig.update_layout(
-    title_text=f"Open-Loop Simulation Validation (RMSE: {np.sqrt(np.mean((y_true_open - y_hat_open)**2)):.4f})",
-    hovermode="x unified",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+fig_intervals.update_layout(
+    title=f"No-freeze intervals (≥ {min_len_hours} h) on Alpha trajectory",
+    xaxis_title="Time",
+    yaxis_title="Alpha"
 )
 
-fig.update_yaxes(title_text="Temperature (°C)", secondary_y=False)
-fig.update_yaxes(title_text="Power (W)", secondary_y=True)
+fig_intervals.show()
 
-fig.show()
+import numpy as np
+import plotly.graph_objects as go
 
-# Cell 6: Plot closed-loop (1-step-ahead) prediction vs true
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) PREP: ARRAYS ALIGNED WITH ts_plot (we skip k=0 everywhere)
+# ─────────────────────────────────────────────────────────────────────────────
+Y_meas_plot = Y_meas[1:]          # measured indoor temp
+u_plot      = u_arr[1:]           # heater power
+T_out_plot  = T_out_arr[1:]       # outside temp
+T_or_plot   = T_or_arr[1:]        # other room temp
 
-plt.figure()
-plt.plot(time_closed, y_true_closed, label="True Temp2", linewidth=1.0)
-plt.plot(time_closed, y_hat_closed, label="ARX closed-loop (1-step-ahead)", linestyle="--", linewidth=1.0)
-plt.title(f"ARX Closed-loop Prediction (lag_order = {lag_order})")
-plt.xlabel("Time")
-plt.ylabel("Temperature [°C]")
-plt.legend()
+# Safety checks
+assert len(ts_plot) == len(Y_meas_plot) == len(u_plot) == len(T_out_plot) == len(T_or_plot)
+
+# RMSE helper
+def rmse(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) LOOP OVER NON-FREEZE INTERVALS AND SIMULATE BOTH MODELS
+# ─────────────────────────────────────────────────────────────────────────────
+interval_results = []   # will hold per-interval metrics
+
+for idx, (s, e) in enumerate(non_freeze_intervals_idx):
+    # Slice segment [s, e] (inclusive) in "plot space"
+    ts_seg    = ts_plot.iloc[s:e+1]
+    y_seg     = Y_meas_plot[s:e+1]
+    u_seg     = u_plot[s:e+1]
+    T_out_seg = T_out_plot[s:e+1]
+    T_or_seg  = T_or_plot[s:e+1]
+
+    # --- LS RC MODEL (discrete 4-node model identified by LS) ---
+    # simulate_open_loop_4c(z, u, T_out, T_or, y, dt, return_states=False)
+    y_ls_seg, _, _, _ = simulate_open_loop_4c(
+        best_z, u_seg, T_out_seg, T_or_seg, y_seg, dt_seconds
+    )
+
+    # --- RBPF RC MODEL (continuous 4-node with theta_final) ---
+    # simulate_open_loop_final_4state(theta_vec, u, T_out, T_or, y_start, dt_total)
+    y_rbpf_seg, _ = simulate_open_loop_final_4state(
+        theta_final, u_seg, T_out_seg, T_or_seg, y_seg[0], dt_seconds
+    )
+
+    # Ensure same length (defensive)
+    min_len = min(len(y_seg), len(y_ls_seg), len(y_rbpf_seg))
+    y_seg       = y_seg[:min_len]
+    y_ls_seg    = y_ls_seg[:min_len]
+    y_rbpf_seg  = y_rbpf_seg[:min_len]
+    ts_seg      = ts_seg.iloc[:min_len]
+
+    # --- RMSEs ---
+    rmse_ls    = rmse(y_seg, y_ls_seg)
+    rmse_rbpf  = rmse(y_seg, y_rbpf_seg)
+
+    interval_results.append({
+        "interval_index": idx + 1,
+        "start_idx_plot": int(s),
+        "end_idx_plot":   int(e),
+        "start_ts": ts_seg.iloc[0],
+        "end_ts":   ts_seg.iloc[-1],
+        "rmse_ls": rmse_ls,
+        "rmse_rbpf": rmse_rbpf,
+    })
+
+    # ─────────────────────────────────────────────────────────────
+    # 3) PLOT: MEASURED VS LS-RC VS RBPF-RC FOR THIS INTERVAL
+    # ─────────────────────────────────────────────────────────────
+    fig_int = go.Figure()
+
+    fig_int.add_trace(go.Scatter(
+        x=ts_seg, y=y_seg,
+        mode='lines', name='Measured',
+        line=dict(color='black', width=2)
+    ))
+
+    fig_int.add_trace(go.Scatter(
+        x=ts_seg, y=y_ls_seg,
+        mode='lines', name='LS RC',
+        line=dict(color='blue', width=2, dash='dash')
+    ))
+
+    fig_int.add_trace(go.Scatter(
+        x=ts_seg, y=y_rbpf_seg,
+        mode='lines', name='RBPF RC',
+        line=dict(color='red', width=2, dash='dot')
+    ))
+
+    fig_int.update_layout(
+        title=(
+            f"No-freeze interval {idx+1}: "
+            f"{ts_seg.iloc[0]} → {ts_seg.iloc[-1]}<br>"
+            f"RMSE LS={rmse_ls:.3f} °C, "
+            f"RMSE RBPF={rmse_rbpf:.3f} °C"
+        ),
+        xaxis_title="Time",
+        yaxis_title="Temperature (°C)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+
+    fig_int.show()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) PRINT SUMMARY TABLE OF RMSE PER INTERVAL
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n=== RMSE per no-freeze interval ===")
+for r in interval_results:
+    print(
+        f"Interval {r['interval_index']:2d} "
+        f"[{r['start_ts']} → {r['end_ts']}]: "
+        f"RMSE_LS = {r['rmse_ls']:.3f} °C, "
+        f"RMSE_RBPF = {r['rmse_rbpf']:.3f} °C"
+    )
+
+# (Optional) overall means
+if interval_results:
+    mean_ls   = np.mean([r["rmse_ls"] for r in interval_results])
+    mean_rbpf = np.mean([r["rmse_rbpf"] for r in interval_results])
+    print(f"\nMean RMSE over all intervals: LS = {mean_ls:.3f} °C, RBPF = {mean_rbpf:.3f} °C")
+
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_squared_error
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime, time
+
+# 1. CONFIGURATION
+#    Define the "Night" window (or any systematic interval)
+EVAL_START_TIME = "20:00"
+EVAL_END_TIME   = "08:00"
+
+print(f"Systematic Evaluation: Simulating independent blocks from {EVAL_START_TIME} to {EVAL_END_TIME}...")
+
+# 2. HELPER: TIME WINDOW MASK
+def is_in_window(ts, start_str, end_str):
+    t = ts.time()
+    s = datetime.strptime(start_str, "%H:%M").time()
+    e = datetime.strptime(end_str, "%H:%M").time()
+    if s <= e:
+        return (t >= s) & (t <= e)
+    else: # Crosses midnight
+        return (t >= s) | (t <= e)
+
+# 3. DETECT BLOCKS
+df_eval = base_df.copy()
+df_eval["In_Window"] = df_eval["Timestamp"].apply(lambda x: is_in_window(x, EVAL_START_TIME, EVAL_END_TIME))
+# Group consecutive True rows
+df_eval["Block_ID"] = (df_eval["In_Window"] != df_eval["In_Window"].shift()).cumsum()
+blocks = df_eval[df_eval["In_Window"]].groupby("Block_ID")
+
+# 4. ITERATE, SIMULATE, AND PLOT
+results = []
+ls_wins = 0
+rbpf_wins = 0
+
+print(f"\nProcessing blocks... (Plots will appear below)")
+
+for _, block_data in blocks:
+    # Filter out short blocks (< 4 hours)
+    if len(block_data) < (4 * 3600 / dt_seconds):
+        continue
+
+    # Extract Data
+    ts_blk     = block_data["Timestamp"]
+    y_meas_blk = block_data["Temp2"].to_numpy(dtype=float)
+    u_blk      = block_data["heat_input"].to_numpy(dtype=float)
+    t_out_blk  = block_data["Sensor_outside"].to_numpy(dtype=float)
+    t_or_blk   = block_data["Other_room_temp"].to_numpy(dtype=float)
+
+    # --- SIMULATE LS (Static) FROM SCRATCH ---
+    # It initializes T_walls, T_heater = y_meas_blk[0]
+    y_ls_blk, _, _, _ = simulate_open_loop_4c(
+        best_z, u_blk, t_out_blk, t_or_blk, y_meas_blk, dt_seconds
+    )
+
+    # --- SIMULATE RBPF (Learned) FROM SCRATCH ---
+    # It initializes T_walls, T_heater = y_meas_blk[0]
+    y_rbpf_blk, _ = simulate_open_loop_final_4state(
+        theta_final, u_blk, t_out_blk, t_or_blk, y_meas_blk[0], dt_seconds
+    )
+
+    # Metrics
+    rmse_ls   = np.sqrt(mean_squared_error(y_meas_blk, y_ls_blk))
+    rmse_rbpf = np.sqrt(mean_squared_error(y_meas_blk, y_rbpf_blk))
+
+    if rmse_rbpf < rmse_ls:
+        rbpf_wins += 1
+        winner = "RBPF"
+    else:
+        ls_wins += 1
+        winner = "LS"
+
+    # Info strings
+    start_str = ts_blk.iloc[0].strftime("%Y-%m-%d %H:%M")
+    end_str   = ts_blk.iloc[-1].strftime("%H:%M")
+    title_str = (f"Night: {start_str} to {end_str} | "
+                 f"RMSE: LS={rmse_ls:.3f}, RBPF={rmse_rbpf:.3f} | Winner: {winner}")
+
+    results.append({
+        "Label": ts_blk.iloc[0].strftime("%m-%d"),
+        "RMSE_LS": rmse_ls,
+        "RMSE_RBPF": rmse_rbpf
+    })
+
+    # --- PLOTTING THIS BLOCK ---
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # 1. Measured
+    fig.add_trace(go.Scatter(
+        x=ts_blk, y=y_meas_blk, name="Measured",
+        mode='lines', line=dict(color='black', width=2)
+    ), secondary_y=False)
+
+    # 2. LS Static
+    fig.add_trace(go.Scatter(
+        x=ts_blk, y=y_ls_blk, name=f"LS Static (RMSE={rmse_ls:.2f})",
+        mode='lines', line=dict(color='blue', width=2, dash='dash')
+    ), secondary_y=False)
+
+    # 3. RBPF Learned
+    fig.add_trace(go.Scatter(
+        x=ts_blk, y=y_rbpf_blk, name=f"RBPF Learned (RMSE={rmse_rbpf:.2f})",
+        mode='lines', line=dict(color='red', width=2, dash='dot')
+    ), secondary_y=False)
+
+    # 4. Heater (Secondary Axis) - Helps explain jumps
+    fig.add_trace(go.Scatter(
+        x=ts_blk, y=u_blk, name="Heater Power",
+        mode='lines', line=dict(color='orange', width=1),
+        fill='tozeroy', opacity=0.1
+    ), secondary_y=True)
+
+    fig.update_layout(
+        title=title_str,
+        height=400,
+        hovermode="x unified",
+        margin=dict(l=20, r=20, t=40, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.update_yaxes(title_text="Temp (°C)", secondary_y=False)
+    fig.update_yaxes(title_text="Power (W)", secondary_y=True, showgrid=False)
+
+    fig.show()
+
+# 5. FINAL SUMMARY PLOT
+print("-" * 60)
+print(f"SUMMARY: LS Wins: {ls_wins} | RBPF Wins: {rbpf_wins}")
+avg_ls = np.mean([r['RMSE_LS'] for r in results])
+avg_rbpf = np.mean([r['RMSE_RBPF'] for r in results])
+print(f"AVG RMSE: LS={avg_ls:.3f} | RBPF={avg_rbpf:.3f}")
+
+if results:
+    labels = [r['Label'] for r in results]
+    y_ls   = [r['RMSE_LS'] for r in results]
+    y_rbpf = [r['RMSE_RBPF'] for r in results]
+
+    fig_sum = go.Figure()
+    fig_sum.add_trace(go.Bar(x=labels, y=y_ls, name='LS Static', marker_color='blue'))
+    fig_sum.add_trace(go.Bar(x=labels, y=y_rbpf, name='RBPF Learned', marker_color='red'))
+    fig_sum.update_layout(
+        title="Overall RMSE Comparison per Night",
+        xaxis_title="Date", yaxis_title="RMSE (°C)", barmode='group'
+    )
+    fig_sum.show()
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
+import numpy as np
+import os
+
+# 1. SETUP & CONFIGURATION
+# ---------------------------------------------------------
+OUTPUT_DIR = "Paper_Plots"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Set professional publication style
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.size': 11,
+    'axes.titlesize': 12,
+    'axes.labelsize': 11,
+    'xtick.labelsize': 10,
+    'ytick.labelsize': 10,
+    'figure.dpi': 300,
+    'savefig.bbox': 'tight'
+})
+
+# 2. DATA PREPARATION
+# ---------------------------------------------------------
+# A. Align Time Series
+# Ensure we match the length of the RBPF output (N particles)
+N_filter = len(Alpha_md)
+ts_plot = base_df["Timestamp"].iloc[:N_filter]
+
+# B. Prepare Diurnal Data (Bottom Plot)
+# Create a temporary DataFrame for aggregation
+df_vol = pd.DataFrame({
+    'Timestamp': ts_plot,
+    'Alpha': Alpha_md
+})
+
+# Bin into 2-hour intervals (0, 2, 4...)
+df_vol['Hour'] = df_vol['Timestamp'].dt.hour
+df_vol['Bin_Start'] = (df_vol['Hour'] // 2) * 2
+
+# Calculate Mean and Std Dev for each bin
+vol_stats = df_vol.groupby('Bin_Start')['Alpha'].agg(['mean', 'std']).reset_index()
+vol_stats['Label'] = vol_stats['Bin_Start'].apply(lambda x: f"{x:02d}-{x+2:02d}")
+
+# 3. PLOTTING
+# ---------------------------------------------------------
+# Create figure with 2 rows, sharing no axes
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [2, 1.2]})
+
+# --- SUBPLOT 1: Alpha Evolution (Time Series) ---
+# Plot Median
+ax1.plot(ts_plot, Alpha_md, color='#333333', linewidth=1.5, label='Median $\\alpha$')
+
+# Plot Confidence Bounds (Shaded Region)
+# Note: Using Alpha_lo/hi (2.5%-97.5%) as proxy for uncertainty bounds
+ax1.fill_between(ts_plot, Alpha_lo, Alpha_hi, color='purple', alpha=0.2,
+                 label='Confidence Interval (Bounds)')
+
+# Formatting Top Plot
+ax1.set_ylabel(r"Stochastic Volatility")
+ax1.set_title("Evolution of Process Noise Sensitivity over Time", fontweight='bold')
+ax1.legend(loc="upper left", frameon=True, fancybox=False, edgecolor='black')
+ax1.grid(True, which='major', linestyle=':', alpha=0.6)
+
+# Date Axis Formatting
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+ax1.xaxis.set_major_locator(mdates.DayLocator(interval=2))
+ax1.set_xlim(ts_plot.iloc[0], ts_plot.iloc[-1])
+
+# --- SUBPLOT 2: Diurnal Profile (Bar Chart) ---
+x_pos = np.arange(len(vol_stats))
+
+# Bar Chart with Error Bars (Std Dev)
+rects = ax2.bar(x_pos, vol_stats['mean'], yerr=vol_stats['std'],
+                align='center', alpha=0.75, color='purple', capsize=5,
+                edgecolor='black', linewidth=0.7, label=r'Mean $\alpha \pm$ 1 Std')
+
+# Formatting Bottom Plot
+ax2.set_xticks(x_pos)
+ax2.set_xticklabels(vol_stats['Label'], rotation=0)
+ax2.set_xlabel("Time of Day (2-Hour Bins)")
+ax2.set_ylabel(r"Mean $\alpha$")
+ax2.set_title("Diurnal Volatility Profile (Systematic Patterns)", fontweight='bold')
+ax2.grid(axis='y', linestyle=':', alpha=0.6)
+ax2.legend(loc='upper right')
+
+# 4. SAVE AND SHOW
+# ---------------------------------------------------------
 plt.tight_layout()
+
+# Save to PDF
+filename = f"{OUTPUT_DIR}/Alpha_Evolution_Diurnal_Composite.pdf"
+plt.savefig(filename, format='pdf')
 plt.show()
+
+print(f"Composite plot saved to: {filename}")
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error
+from datetime import datetime
+import os
+
+# --- 1. CONFIGURATION ---
+EVAL_START_TIME = "20:00"
+EVAL_END_TIME   = "08:00"
+OUTPUT_DIR      = "Night_Eval_Plots"
+
+# Create output directory
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Set professional style parameters
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.size': 10,
+    'axes.titlesize': 12,
+    'axes.labelsize': 11,
+    'legend.fontsize': 9,
+    'xtick.labelsize': 9,
+    'ytick.labelsize': 9,
+    'figure.dpi': 300, # High resolution
+    'savefig.bbox': 'tight'
+})
+
+# --- 2. DATA PREPARATION (Block Detection) ---
+def is_in_window(ts, start_str, end_str):
+    t = ts.time()
+    s = datetime.strptime(start_str, "%H:%M").time()
+    e = datetime.strptime(end_str, "%H:%M").time()
+    if s <= e:
+        return (t >= s) & (t <= e)
+    else: # Crosses midnight
+        return (t >= s) | (t <= e)
+
+df_eval = base_df.copy()
+df_eval["In_Window"] = df_eval["Timestamp"].apply(lambda x: is_in_window(x, EVAL_START_TIME, EVAL_END_TIME))
+df_eval["Block_ID"] = (df_eval["In_Window"] != df_eval["In_Window"].shift()).cumsum()
+blocks = df_eval[df_eval["In_Window"]].groupby("Block_ID")
+
+results = []
+ls_wins = 0
+rbpf_wins = 0
+
+print(f"Generating plots in '{OUTPUT_DIR}'...")
+
+# --- 3. MAIN LOOP ---
+for i, (_, block_data) in enumerate(blocks):
+    # Filter short blocks
+    if len(block_data) < (4 * 3600 / dt_seconds):
+        continue
+
+    # Extract Data
+    ts_blk      = block_data["Timestamp"]
+    y_meas_blk  = block_data["Temp2"].to_numpy(dtype=float)
+    u_blk       = block_data["heat_input"].to_numpy(dtype=float)
+    t_out_blk   = block_data["Sensor_outside"].to_numpy(dtype=float)
+    t_or_blk    = block_data["Other_room_temp"].to_numpy(dtype=float)
+
+    # --- SIMULATIONS ---
+    # 1. LS Static (Open Loop)
+    y_ls_blk, _, _, _ = simulate_open_loop_4c(
+        best_z, u_blk, t_out_blk, t_or_blk, y_meas_blk, dt_seconds
+    )
+
+    # 2. RBPF Learned (Open Loop using final params)
+    y_rbpf_blk, _ = simulate_open_loop_final_4state(
+        theta_final, u_blk, t_out_blk, t_or_blk, y_meas_blk[0], dt_seconds
+    )
+
+    # Metrics
+    rmse_ls   = np.sqrt(mean_squared_error(y_meas_blk, y_ls_blk))
+    rmse_rbpf = np.sqrt(mean_squared_error(y_meas_blk, y_rbpf_blk))
+
+    # Winner logic
+    if rmse_rbpf < rmse_ls:
+        rbpf_wins += 1
+        winner_color = 'red' # RBPF color
+    else:
+        ls_wins += 1
+        winner_color = 'blue' # LS color
+
+    # Store results
+    date_label = ts_blk.iloc[0].strftime("%Y-%m-%d")
+    results.append({
+        "Label": ts_blk.iloc[0].strftime("%m-%d"),
+        "RMSE_LS": rmse_ls,
+        "RMSE_RBPF": rmse_rbpf
+    })
+
+    # --- PLOTTING (Matplotlib) ---
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+
+    # Title
+    start_str = ts_blk.iloc[0].strftime("%H:%M")
+    end_str   = ts_blk.iloc[-1].strftime("%H:%M")
+    ax1.set_title(f"Evaluation: {date_label} ({start_str}-{end_str})\n"
+                  f"LS RMSE: {rmse_ls:.3f} | RBPF RMSE: {rmse_rbpf:.3f}", fontweight='bold')
+
+    # Primary Axis (Temperature)
+    ax1.set_xlabel("Time (HH:MM)")
+    ax1.set_ylabel("Temperature ($^{\circ}$C)", color='black')
+
+    # Plots
+    l1, = ax1.plot(ts_blk, y_meas_blk, 'k-', lw=1.5, alpha=0.8, label='Measured')
+    l2, = ax1.plot(ts_blk, y_ls_blk, color='blue', linestyle='--', lw=1.5, label=f'LS Static')
+    l3, = ax1.plot(ts_blk, y_rbpf_blk, color='red', linestyle='-.', lw=1.5, label=f'RBPF Learned')
+
+    # Secondary Axis (Heater Power)
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("Heater Power (W)", color='orange')
+    l4 = ax2.fill_between(ts_blk, u_blk, color='orange', alpha=0.2, label='Heater Power')
+    ax2.tick_params(axis='y', labelcolor='orange')
+
+    # Formatting Time Axis
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    plt.setp(ax1.get_xticklabels(), rotation=0, ha='center')
+
+    # Grid
+    ax1.grid(True, which='major', linestyle=':', alpha=0.6)
+
+    # Legend (Combine both axes)
+    lines = [l1, l2, l3, l4]
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper center', bbox_to_anchor=(0.5, -0.15),
+               ncol=4, frameon=False)
+
+    # Save PDF
+    filename = f"{OUTPUT_DIR}/Eval_{date_label}_LSvsRBPF.pdf"
+    plt.savefig(filename, format='pdf', bbox_inches='tight')
+    plt.close(fig) # Close to free memory
+
+# --- 4. SUMMARY PLOT ---
+if results:
+    labels = [r['Label'] for r in results]
+    y_ls   = [r['RMSE_LS'] for r in results]
+    y_rbpf = [r['RMSE_RBPF'] for r in results]
+
+    x = np.arange(len(labels))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    rects1 = ax.bar(x - width/2, y_ls, width, label='LS Static', color='blue', alpha=0.7)
+    rects2 = ax.bar(x + width/2, y_rbpf, width, label='RBPF Learned', color='red', alpha=0.7)
+
+    ax.set_ylabel('RMSE ($^{\circ}$C)')
+    ax.set_title('Model Performance Comparison per Night')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45)
+    ax.legend()
+    ax.grid(axis='y', linestyle=':', alpha=0.5)
+
+    # Add text for overall stats
+    stats_text = (f"Total Nights: {len(results)}\n"
+                  f"Avg RMSE (LS): {np.mean(y_ls):.3f}\n"
+                  f"Avg RMSE (RBPF): {np.mean(y_rbpf):.3f}")
+
+    props = dict(boxstyle='round', facecolor='white', alpha=0.8)
+    ax.text(0.02, 0.95, stats_text, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', bbox=props)
+
+    plt.savefig(f"{OUTPUT_DIR}/Eval_Summary_RMSE.pdf", format='pdf', bbox_inches='tight')
+    plt.show() # Show summary inline
+    print(f"\nProcessing Complete. {len(results)} plot files saved to folder '{OUTPUT_DIR}'.")

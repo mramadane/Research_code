@@ -6,7 +6,7 @@ from typing import Dict, Tuple
 import numpy as np
 
 from .config import RBPFConfig
-from .model import ThermalParams, default_param_ranges, discrete_from_theta
+from .model import ThermalParams, continuous_from_theta, default_param_ranges
 from .parameters import build_parameter_bounds
 
 
@@ -127,7 +127,7 @@ def run_rbpf(
     alpha_bin_edges = np.linspace(log_alpha_min, log_alpha_max, n_bins_alpha + 1)
     pseudo_count = 1.0
     alpha_hist_counts = np.full(n_bins_alpha, pseudo_count, dtype=float)
-    F_quiet, F_burst = 0.50, 0.80
+    F_quiet, F_burst = cfg.gate_quiet, cfg.gate_burst
 
     q_lo, q_md, q_hi = 0.025, 0.50, 0.975
     Ti_lo = np.zeros(N)
@@ -158,8 +158,6 @@ def run_rbpf(
     Tau_hi = np.zeros((N, len(tau_defs)))
 
     Nsamp_state = 2000
-    Nsamp_predH = 2000
-    H = cfg.horizon
 
     # t = 0 summaries
     w_lin = np.exp(logw - _logsumexp(logw))
@@ -181,6 +179,10 @@ def run_rbpf(
 
     I5_batch = np.eye(5)[None, :, :]
     const_ll = -0.5 * np.log(2 * np.pi)
+    dt_total = float(dt_seconds)
+    dt_sub_target = max(1.0, float(cfg.substep_seconds))
+    n_subs = max(1, int(round(dt_total / dt_sub_target)))
+    dt_sub = dt_total / n_subs
 
     for k in range(1, N):
         uk, Tok, Usk = u_arr[k - 1], T_out[k - 1], U_s_arr[k - 1]
@@ -227,14 +229,16 @@ def run_rbpf(
             phi[:, fixed_idx] = np.log(np.clip(theta_lo[fixed_idx], theta_eps, None))
         theta = np.exp(phi)
 
-        Phi_i, Gu_i, GTo_i, GUs_i = discrete_from_theta(theta, dt_seconds, params.aw, params.ae, params.eta_h)
+        A_c_i, B_u_i, B_To_i, B_Us_i = continuous_from_theta(theta, params.aw, params.ae, params.eta_h)
 
-        m_pred = np.einsum("ni,nji->nj", m, Phi_i)
-        m_pred += uk * Gu_i
-        m_pred += Tok * GTo_i
-        m_pred += Usk * GUs_i
+        m_pred = m.copy()
+        for _ in range(n_subs):
+            dx = np.einsum("nij,nj->ni", A_c_i, m_pred)
+            dx += uk * B_u_i + Tok * B_To_i + Usk * B_Us_i
+            m_pred += dx * dt_sub
 
-        P_pred = np.einsum("nij,njk,nlk->nil", Phi_i, P, Phi_i)
+        Phi_approx = I5_batch + A_c_i * dt_total
+        P_pred = np.einsum("nij,njk,nlk->nil", Phi_approx, P, Phi_approx)
         scale_sq = np.exp(2.0 * log_alpha)
         qdiag = scale_sq[:, None] * Q0_diag[None, :]
         for s in range(5):
@@ -261,24 +265,6 @@ def run_rbpf(
         m = m_pred + (K.reshape(Np, 5) * innov[:, None])
         KC = np.matmul(K, C_y)
         P = np.matmul(I5_batch - KC, P_pred)
-
-        if H >= 1:
-            m_h = m.copy()
-            P_h = P.copy()
-            scale_sq_h = np.exp(2.0 * log_alpha)
-            qdiag_h = scale_sq_h[:, None] * Q0_diag[None, :]
-            for h in range(1, H + 1):
-                kh = min(k + h - 1, N - 1)
-                uk_h = u_arr[kh]
-                Tok_h = T_out[kh]
-                Usk_h = U_s_arr[kh]
-                m_h = np.einsum("ni,nji->nj", m_h, Phi_i)
-                m_h += uk_h * Gu_i
-                m_h += Tok_h * GTo_i
-                m_h += Usk_h * GUs_i
-                P_h = np.einsum("nij,njk,nlk->nil", Phi_i, P_h, Phi_i)
-                for s in range(5):
-                    P_h[:, s, s] += qdiag_h[:, s]
 
         Ti_draws = _sample_gaussian_mixture(m[:, 0], P[:, 0, 0], w_lin_post, Nsamp_state, rng)
         TiC = Ti_draws - 273.15
